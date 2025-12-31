@@ -1,80 +1,92 @@
 import pandas as pd
 import collections
 
-def processar_irs_nexo(input_file):
-    # Carregar dados
-    df = pd.read_csv(input_file)
+def motor_fiscal_nexo(input_path):
+    # 1. Carregamento e Limpeza (Lógica de Sinais)
+    df = pd.read_csv(input_path)
     df['Date / Time (UTC)'] = pd.to_datetime(df['Date / Time (UTC)'])
     df = df.sort_values('Date / Time (UTC)')
 
-    # Inventário por moeda (FIFO)
-    inventory = collections.defaultdict(list)
+    # Inventário segregado (Art. 43º)
+    inventory = collections.defaultdict(list) 
     
-    # Relatórios de saída
-    vendas_fiat = []
-    permutas = []
+    report_irs = []   # Vendas para Fiat (Anexo G)
+    report_swaps = [] # Permutas (Herança de Custo)
+
+    # Definição de Moedas Fiduciárias (e equivalentes para apuramento)
+    fiat_list = ['EUR', 'USD', 'GBP', 'EURX', 'USDX']
 
     for _, row in df.iterrows():
-        tipo = row['Type']
-        moeda_in = row['Input Currency']
-        qtd_in = abs(float(row['Input Amount']))
-        moeda_out = row['Output Currency']
-        qtd_out = float(row['Output Amount'])
         data = row['Date / Time (UTC)']
+        tipo = row['Type']
+        
+        # Identificar Moedas e Quantidades (Sinais Reais)
+        m_in, q_in = row['Input Currency'], abs(float(row['Input Amount']))
+        m_out, q_out = row['Output Currency'], abs(float(row['Output Amount']))
         valor_usd = float(str(row['USD Equivalent']).replace('$', '').replace(',', ''))
 
-        # 1. ENTRADAS (Aquisições / Juros / Cashback)
-        # Juros e Cashback entram com custo zero 
-        if tipo in ['Interest', 'Exchange Cashback', 'Top up Crypto', 'Deposit']:
-            custo = 0.0 if tipo in ['Interest', 'Exchange Cashback'] else valor_usd
-            inventory[moeda_out].append({'date': data, 'qty': qtd_out, 'cost': custo})
+        # A. ENTRADAS (Deposit, Interest, Bonus)
+        # Juros e Bonus entram com Custo Zero conforme instrução
+        if tipo in ['Interest', 'Deposit', 'Exchange Cashback', 'Top up Crypto', 'Dividend']:
+            custo_unitario = 0.0 if tipo in ['Interest', 'Exchange Cashback', 'Dividend'] else valor_usd
+            inventory[m_out].append({'date': data, 'qty': q_out, 'cost_total': custo_unitario})
             continue
 
-        # 2. TROCAS (Exchange)
-        if tipo == 'Exchange':
-            # É uma Permuta se for Cripto-para-Cripto 
-            is_fiat = moeda_out in ['EUR', 'USD', 'EURX'] # EURX tratado como fiduciária para apuramento
-            
-            # Retirar do inventário (FIFO)
-            total_cost_basis = 0
-            remaining_to_sell = qtd_in
-            
-            while remaining_to_sell > 0 and inventory[moeda_in]:
-                lote = inventory[moeda_in][0]
-                if lote['qty'] <= remaining_to_sell:
-                    total_cost_basis += lote['cost']
-                    remaining_to_sell -= lote['qty']
-                    inventory[moeda_in].pop(0)
-                else:
-                    # Venda parcial do lote
-                    proporcao = remaining_to_sell / lote['qty']
-                    total_cost_basis += lote['cost'] * proporcao
-                    lote['cost'] -= lote['cost'] * proporcao
-                    lote['qty'] -= remaining_to_sell
-                    remaining_to_sell = 0
+        # B. SAÍDAS E PERMUTAS (Exchange, Card, Withdrawal)
+        if tipo in ['Exchange', 'Card Reflection', 'Withdrawal']:
+            # Se for levantamento direto de cripto, apenas removemos do inventário
+            if tipo == 'Withdrawal' and m_in not in fiat_list:
+                # (Lógica de reconciliação externa pode ser aplicada aqui)
+                pass 
 
-            if is_fiat:
-                # Evento Tributável: Venda para Fiat 
-                vendas_fiat.append({
+            # Processamento FIFO para saídas
+            remaining = q_in
+            total_cost_basis = 0
+            datas_aquisicao = []
+
+            while remaining > 0 and inventory[m_in]:
+                lote = inventory[m_in][0]
+                if lote['qty'] <= remaining:
+                    total_cost_basis += lote['cost_total']
+                    remaining -= lote['qty']
+                    datas_aquisicao.append(lote['date'])
+                    inventory[m_in].pop(0)
+                else:
+                    ratio = remaining / lote['qty']
+                    custo_parcial = lote['cost_total'] * ratio
+                    total_cost_basis += custo_parcial
+                    lote['cost_total'] -= custo_parcial
+                    lote['qty'] -= remaining
+                    datas_aquisicao.append(lote['date'])
+                    remaining = 0
+
+            # C. CLASSIFICAÇÃO FISCAL
+            # Se a saída for para FIAT ou pagamento (Card) = EVENTO TRIBUTÁVEL
+            if m_out in fiat_list or tipo == 'Card Reflection':
+                report_irs.append({
                     'Data_Venda': data,
-                    'Moeda': moeda_in,
+                    'Ativo': m_in,
+                    'Quantidade': q_in,
+                    'Data_Aquisicao': datas_aquisicao[0] if datas_aquisicao else data,
                     'Valor_Venda_USD': valor_usd,
                     'Custo_Aquisicao_USD': total_cost_basis,
-                    'Plus_Valia': valor_usd - total_cost_basis
+                    'Resultado': valor_usd - total_cost_basis,
+                    'Hold_Superior_365d': (data - datas_aquisicao[0]).days > 365 if datas_aquisicao else False
                 })
-            else:
-                # Permuta Isenta: Herança de custo 
-                inventory[moeda_out].append({
-                    'date': data, 
-                    'qty': qtd_out, 
-                    'cost': total_cost_basis
+            
+            # Se for Cripto-Cripto = PERMUTA ISENTA (Herança de Custo)
+            elif m_in not in fiat_list and m_out not in fiat_list:
+                inventory[m_out].append({
+                    'date': datas_aquisicao[0] if datas_aquisicao else data,
+                    'qty': q_out,
+                    'cost_total': total_cost_basis
                 })
-                permutas.append({
-                    'Data': data, 'Saiu': moeda_in, 'Entrou': moeda_out, 'Custo_Transferido': total_cost_basis
+                report_swaps.append({
+                    'Data': data, 'Saiu': m_in, 'Entrou': m_out, 'Custo_Herdado': total_cost_basis
                 })
 
-    return pd.DataFrame(vendas_fiat), pd.DataFrame(permutas)
+    return pd.DataFrame(report_irs), pd.DataFrame(report_swaps)
 
-# Execução
-vendas, trocas = processar_irs_nexo('nexo_transactions.csv')
-vendas.to_csv('G_Plus_Valias_Nexo.csv', index=False)
+# Gerar Relatórios
+vendas_df, swaps_df = motor_fiscal_nexo('nexo_transactions.csv')
+vendas_df.to_csv('G_Plus_Valias_Nexo_Final.csv', index=False, decimal=',')
